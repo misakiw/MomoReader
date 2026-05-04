@@ -45,6 +45,8 @@ import io.legado.app.utils.printOnDebug
 import io.legado.app.utils.servicePendingIntent
 import io.legado.app.utils.toastOnUi
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers.IO
 import kotlinx.coroutines.Dispatchers.Main
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
@@ -58,6 +60,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Response
 import org.mozilla.javascript.WrappedException
@@ -77,10 +80,10 @@ class HttpReadAloudService : BaseReadAloudService(),
     private val exoPlayer: ExoPlayer by lazy {
         ExoPlayer.Builder(this).setLoadControl(
             DefaultLoadControl.Builder().setBufferDurationsMs(
-                1800_000_000,
-                1800_000_000,
-                DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
-                DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS
+                DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
+                DefaultLoadControl.DEFAULT_MAX_BUFFER_MS,
+                100,  // bufferForPlaybackMs: start playback almost immediately for local files
+                100   // bufferForPlaybackAfterRebufferMs: same after rebuffer
             ).build()
         ).build()
     }
@@ -108,6 +111,7 @@ class HttpReadAloudService : BaseReadAloudService(),
     private var playErrorNo = 0
     private val downloadTaskActiveLock = Mutex()
     private val loadingState = MutableStateFlow(false)
+    private val downloadErrorLock = Any()
 
     override fun onCreate() {
         super.onCreate()
@@ -163,8 +167,10 @@ class HttpReadAloudService : BaseReadAloudService(),
             downloadTaskActiveLock.withLock {
                 ensureActive()
                 val httpTts = ReadAloud.httpTTS ?: throw NoStackTraceException("tts is null")
+                // Build the list of items to download
+                data class DownloadItem(val text: String, val fileName: String, val speakText: String)
+                val items = mutableListOf<DownloadItem>()
                 contentList.forEachIndexed { index, content ->
-                    ensureActive()
                     if (index < nowSpeak) return@forEachIndexed
                     var text = content
                     if (paragraphStartPos > 0 && index == nowSpeak) {
@@ -172,24 +178,60 @@ class HttpReadAloudService : BaseReadAloudService(),
                     }
                     val fileName = md5SpeakFileName(text)
                     val speakText = text.replace(AppPattern.notReadAloudRegex, "")
-                    if (speakText.isEmpty()) {
-                        AppLog.put("阅读段落内容为空，使用无声音频代替。\n朗读文本：$text")
-                        createSilentSound(fileName)
-                    } else if (!hasSpeakFile(fileName)) {
-                        runCatching {
-                            val inputStream = getSpeakStream(httpTts, speakText)
-                            if (inputStream != null) {
-                                createSpeakFile(fileName, inputStream)
-                            } else {
-                                createSilentSound(fileName)
+                    items.add(DownloadItem(text, fileName, speakText))
+                }
+                // Use a channel as an ordered pipeline: producer launches parallel
+                // downloads, consumer awaits them in order and feeds ExoPlayer.
+                val resultChannel = Channel<CompletableDeferred<String>>(PARALLEL_DOWNLOAD_COUNT)
+                // Producer: for each paragraph, create a deferred download and send
+                // it into the channel immediately, then acquire the semaphore before
+                // the next iteration so at most PARALLEL_DOWNLOAD_COUNT are in flight.
+                val parallelSemaphore = Semaphore(PARALLEL_DOWNLOAD_COUNT)
+                val producerJob = launch(IO) {
+                    try {
+                        for (item in items) {
+                            ensureActive()
+                            parallelSemaphore.acquire()
+                            val deferred = CompletableDeferred<String>()
+                            launch(IO) {
+                                try {
+                                    if (item.speakText.isEmpty()) {
+                                        AppLog.put("阅读段落内容为空，使用无声音频代替。\n朗读文本：${item.text}")
+                                        createSilentSound(item.fileName)
+                                    } else if (!hasSpeakFile(item.fileName)) {
+                                        val inputStream = getSpeakStream(httpTts, item.speakText)
+                                        if (inputStream != null) {
+                                            createSpeakFile(item.fileName, inputStream)
+                                        } else {
+                                            createSilentSound(item.fileName)
+                                        }
+                                    }
+                                    deferred.complete(item.fileName)
+                                } catch (e: CancellationException) {
+                                    deferred.cancel(e)
+                                } catch (e: Exception) {
+                                    deferred.completeExceptionally(e)
+                                } finally {
+                                    parallelSemaphore.release()
+                                }
                             }
-                        }.onFailure {
-                            when (it) {
-                                is CancellationException -> Unit
-                                else -> pauseReadAloud()
-                            }
-                            return@execute
+                            resultChannel.send(deferred)
                         }
+                    } finally {
+                        resultChannel.close()
+                    }
+                }
+                // Consumer: receive deferreds in order, await each, add to ExoPlayer
+                for (deferred in resultChannel) {
+                    val fileName = try {
+                        deferred.await()
+                    } catch (e: CancellationException) {
+                        producerJob.cancel()
+                        throw e
+                    } catch (e: Exception) {
+                        pauseReadAloud()
+                        producerJob.cancel()
+                        return@withLock
                     }
                     val file = getSpeakFileAsMd5(fileName)
                     val mediaItem = MediaItem.fromUri(Uri.fromFile(file))
@@ -370,7 +412,7 @@ class HttpReadAloudService : BaseReadAloudService(),
                 }
                 currentCoroutineContext().ensureActive()
                 response.body.byteStream().let { stream ->
-                    downloadErrorNo = 0
+                    synchronized(downloadErrorLock) { downloadErrorNo = 0 }
                     return stream
                 }
             } catch (e: Exception) {
@@ -383,8 +425,11 @@ class HttpReadAloudService : BaseReadAloudService(),
                     }
 
                     is SocketTimeoutException, is ConnectException -> {
-                        downloadErrorNo++
-                        if (downloadErrorNo > 5) {
+                        val shouldThrow = synchronized(downloadErrorLock) {
+                            downloadErrorNo++
+                            downloadErrorNo > 5
+                        }
+                        if (shouldThrow) {
                             val msg = "tts超时或连接错误超过5次\n${e.localizedMessage}"
                             AppLog.put(msg, e, true)
                             throw e
@@ -392,11 +437,14 @@ class HttpReadAloudService : BaseReadAloudService(),
                     }
 
                     else -> {
-                        downloadErrorNo++
+                        val errorCount = synchronized(downloadErrorLock) {
+                            downloadErrorNo++
+                            downloadErrorNo
+                        }
                         val msg = "tts下载错误\n${e.localizedMessage}"
                         AppLog.put(msg, e)
                         e.printOnDebug()
-                        if (downloadErrorNo > 5) {
+                        if (errorCount > 5) {
                             val msg1 = "TTS服务器连续5次错误，已暂停阅读。"
                             AppLog.put(msg1, e, true)
                             throw e
@@ -612,6 +660,11 @@ class HttpReadAloudService : BaseReadAloudService(),
         override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
             return C.TIME_UNSET
         }
+    }
+
+    companion object {
+        /** Number of paragraphs to download concurrently ahead of playback. */
+        private const val PARALLEL_DOWNLOAD_COUNT = 3
     }
 
 }
