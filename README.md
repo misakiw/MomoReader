@@ -1,7 +1,7 @@
 # [English](English.md) [中文](README.md)
 
 <div align="center">
-<img width="125" height="125" src="https://github.com/misakiw/MomoReaeer/raw/master/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png" alt="MomoReader"/>  
+<img width="125" height="125" src="https://github.com/misakiw/MomoReader/raw/master/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png" alt="MomoReader"/>  
   
 MomoReader
 <br>
